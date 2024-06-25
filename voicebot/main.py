@@ -1,207 +1,138 @@
-import asyncio
-import shutil
-import subprocess
-import aiohttp
+import os
+import time
+from openai import OpenAI
+import speech_recognition as sr
+from supabase import create_client, Client
+from typing import List, Dict
+from playsound import playsound
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-from langchain.chains import LLMChain
+from dotenv import load_dotenv
+load_dotenv()
 
-from deepgram import (
-    DeepgramClient,
-    DeepgramClientOptions,
-    LiveTranscriptionEvents,
-    LiveOptions,
-    Microphone,
-)
+# Configuration
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-class LanguageModelProcessor:
-    def _init_(self):
-        self.llm = ChatGroq(temperature=0, model_name="mixtral-8x7b-32768", groq_api_key="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")
-        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+# OpenAI API key
+client = OpenAI(api_key = os.getenv('OPENAI_API_KEY'))
 
-        # Load the system prompt from a file
-        with open('system_prompt.txt', 'r') as file:
-            system_prompt = file.read().strip()
-        
-        self.prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{text}")
-        ])
+# Initialize Supabase
+def store_conversation(user_query: str, bot_response: str):
+    data = {
+        "query": user_query,
+        "response": bot_response
+    }
+    supabase.table('respondedqueries').insert(data).execute()
 
-        self.conversation = LLMChain(
-            llm=self.llm,
-            prompt=self.prompt,
-            memory=self.memory
-        )
-
-    async def process_stream(self, text, callback):
-        self.memory.chat_memory.add_user_message(text)  # Add user message to memory
-
-        response = self.conversation.invoke({"text": text})  # No await here
-        truncated_response = self.truncate_response(response['text'])
-        self.memory.chat_memory.add_ai_message(truncated_response)  # Add AI response to memory
-        await callback(truncated_response)
-
-    def truncate_response(self, response, max_words=50):
-        words = response.split()
-        if len(words) > max_words:
-            return ' '.join(words[:max_words]) + '...'
-        return response
-
-
-class TextToSpeech:
-    # Set your Deepgram API Key and desired voice model
-    DG_API_KEY = "031aaec2175638841f1a30eae58d816ae9e05ac1"
-    MODEL_NAME = "aura-helios-en"  # Example model name, change as needed
-
-    @staticmethod 
-    def is_installed(lib_name: str) -> bool:
-        lib = shutil.which(lib_name)
-        return lib is not None
-
-    async def speak_streaming(self, text_stream):
-        if not self.is_installed("ffplay"):
-            raise ValueError("ffplay not found, necessary to stream audio.")
-
-        DEEPGRAM_URL = f"https://api.deepgram.com/v1/speak?model={self.MODEL_NAME}&performance=some&encoding=linear16&sample_rate=24000"
-        headers = {
-            "Authorization": f"Token {self.DG_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        player_command = ["ffplay", "-autoexit", "-", "-nodisp"]
-        player_process = subprocess.Popen(
-            player_command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        async with aiohttp.ClientSession() as session:
-            for text in text_stream:
-                payload = {"text": text}
-                async with session.post(DEEPGRAM_URL, headers=headers, json=payload) as r:
-                    async for chunk in r.content.iter_chunked(1024):
-                        if chunk:
-                            player_process.stdin.write(chunk)
-                            player_process.stdin.flush()
-
-        if player_process.stdin:
-            player_process.stdin.close()
-        player_process.wait()
-
-
-class TranscriptCollector:
-    def _init_(self):
-        self.reset()
-
-    def reset(self):
-        self.transcript_parts = []
-
-    def add_part(self, part):
-        self.transcript_parts.append(part)
-
-    def get_full_transcript(self):
-        return ' '.join(self.transcript_parts)
-
-
-transcript_collector = TranscriptCollector()
-
-async def get_transcript(callback):
-    transcription_complete = asyncio.Event()  # Event to signal transcription completion
-
+def fetch_previous_response(query: str) -> str:
     try:
-        # example of setting up a client config. logging values: WARNING, VERBOSE, DEBUG, SPAM
-        config = DeepgramClientOptions(options={"keepalive": "true"})
-
-        deepgram: DeepgramClient = DeepgramClient("031aaec2175638841f1a30eae58d816ae9e05ac1", config)
-
-
-        dg_connection = deepgram.listen.asynclive.v("1")
-        print ("Listening...")
-
-        async def on_message(self, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
-            
-            if not result.speech_final:
-                transcript_collector.add_part(sentence)
-            else:
-                # This is the final part of the current sentence
-                transcript_collector.add_part(sentence)
-                full_sentence = transcript_collector.get_full_transcript()
-                # Check if the full_sentence is not empty before printing
-                if len(full_sentence.strip()) > 0:
-                    full_sentence = full_sentence.strip()
-                    print(f"Human: {full_sentence}")
-                    callback(full_sentence)  # Call the callback with the full_sentence
-                    transcript_collector.reset()
-                    transcription_complete.set()  # Signal to stop transcription and exit
-
-        dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-
-        options = LiveOptions(
-            model="nova-2",
-            punctuate=True,
-            language="en-US",
-            encoding="linear16",
-            channels=1,
-            sample_rate=16000,
-            endpointing=300,
-            smart_format=True,
-        )
-
-        await dg_connection.start(options)
-
-        # Open a microphone stream on the default input device
-        microphone = Microphone(dg_connection.send)
-        microphone.start()
-
-        await transcription_complete.wait()  # Wait for the transcription to complete instead of looping indefinitely
-
-        # Wait for the microphone to close
-        microphone.finish()
-
-        # Indicate that we've finished
-        await dg_connection.finish()
+        # Fetch records from Supabase where the query is similar to the input query
+        response = supabase.table('respondedqueries').select("response").eq('query', query).execute()
+        
+        if response.data:
+            return response.data[0]['response']  # Return the first matched response
 
     except Exception as e:
-        print(f"Could not open socket: {e}")
-        return
+        print(f"Error fetching previous response from supabase: {e}")
 
+    return None
 
-class ConversationManager:
-    def _init_(self):
-        self.transcription_response = ""
-        self.llm = LanguageModelProcessor()
-        self.tts = TextToSpeech()
+def generate_response(query: str, conversation_history: List[Dict[str, str]]) -> str:
+    # Construct prompt with previous queries and responses
+    prompt = "Previous queries and responses:\n\n"
+    for interaction in conversation_history:
+        prompt += f"User: {interaction['query']}\nBot: {interaction['response']}\n\n"
+    
+    prompt += "do not respond with anything like 'Based on the previous queries, here is a response to your question:'"
 
-    async def main(self):
-        def handle_full_sentence(full_sentence):
-            self.transcription_response = full_sentence
+    # Add current query to prompt
+    prompt += f"User's query: {query}\n\nBased on the above information, provide a response to the user's query."
 
-        while True:
-            await get_transcript(handle_full_sentence)
-            
-            if "goodbye" in self.transcription_response.lower():
-                break
-            
-            async def callback_partial_response(partial_response):
-                await self.tts.speak_streaming([partial_response])
+    # Generate response using GPT-3.5 Turbo
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "you are a very accurate voice bot which remembers all the previous asked questions and answers further questions accordingly just like a human assistant"},
+            {"role": "user", "content": prompt}
+        ]
+    )
 
-            await self.llm.process_stream(self.transcription_response, callback_partial_response)
-            self.transcription_response = ""
+    return response.choices[0].message.content
 
+# this is seech to text
+def get_voice_input(seconds=5) -> str:
+    r = sr.Recognizer()
 
-if _name_ == "_main_":
-    manager = ConversationManager()
-    asyncio.run(manager.main())
+    with sr.Microphone() as source:
+        print("heed...")
+        audio = r.listen(source, timeout=seconds)
+    try:
+        query = r.recognize_whisper_api(audio, api_key=OPENAI_API_KEY)
+        return query
+    except sr.RequestError as e:
+        print(f"Could not request results from Whisper API; {e}")
+        return ""
+
+def delay(seconds):
+    time.sleep(seconds)
+
+def text_to_speech(text):
+    response = client.audio.speech.create(
+        model= "tts-1",
+        voice= "nova",
+        input= text,
+        speed= 1
+    )
+
+    filename = "speech.mp3"
+
+    # Save the response to a file
+    with open(filename, "wb") as f:
+        f.write(response.content)
+
+    delay(1)
+    
+    playsound(filename)
+
+# main code (brain of the bot)
+recognizer = sr.Recognizer()
+conversation_history = []
+
+# Greet the user
+text_to_speech("Greetings! what is your name?")
+
+# asking the user for his name
+user_name = get_voice_input(2)
+text_to_speech(f"Greetings {user_name}! <prosody rate='fast'>I am Stella!!, your personal assistant!!. How may I assist you today?</prosody>")
+
+# asking the user for queries
+while True:
+    query = get_voice_input()
+
+    print(query.lower())
+
+    # terminating condition
+    if query.lower() in ["exit","exit."]:
+        text_to_speech(f"<emphasis>Hope you like my assistance. Looking forward to assisting you further. Goodbye {user_name}! Have a great day!</emphasis>")
+        break
+
+    else:
+        previous_response = fetch_previous_response(query)
+
+        if previous_response:
+            print(f"User: {query}")
+            response = previous_response
+            print(f"Stella: {response}")
+            conversation_history.append({"query": query, "response": response})
+            text_to_speech(response)
+
+        else:
+            print(f"User: {query}")
+            response = generate_response(query, conversation_history)
+            print(f"Stella: {response}")
+            store_conversation(query, response)
+            conversation_history.append({"query": query, "response": response})
+            text_to_speech(response)   
