@@ -67,7 +67,7 @@ def get_voice_input(seconds=5) -> str:
     r = sr.Recognizer()
 
     with sr.Microphone() as source:
-        print("heed...")
+        print("heed...🎙️")
         audio = r.listen(source, timeout=seconds)
     try:
         query = r.recognize_whisper_api(audio, api_key=OPENAI_API_KEY)
